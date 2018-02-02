@@ -179,7 +179,7 @@ var
   ct : integer;
   cnt: TLargeinteger;
 begin
-  QueryPerformanceCounter(TInt64((@Cnt)^));
+  QueryPerformanceCounter(Cnt);
   ct := GetCurrentThreadID;
 {$B+}
   if prfRunning and ((prfOnlyThread = 0) or (prfOnlyThread = ct)) then begin
@@ -393,7 +393,7 @@ begin
     if profPrfOutputFile <> '' then
       prfName := profPrfOutputFile + '.prf';
     prfWriter := TSimpleBlockWriter.Create(prfName);
-    QueryPerformanceFrequency(TInt64((@prfFreq)^));
+    QueryPerformanceFrequency(prfFreq);
   end;
 end; { Initialize }
 
