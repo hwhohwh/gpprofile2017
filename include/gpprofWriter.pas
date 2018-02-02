@@ -13,9 +13,9 @@ type
   TSimpleBlockWriter = class
   private
     fFilename    : string;
-    fBuf         : pointer;
+    fBuf         : TBytes;
     fBufOffs     : integer;
-    fFile        : THandle;
+    fFile        : TFileStream;
     fLock        : TCriticalSection;
 
     function OffsetPtr(ptr: pointer; offset: Cardinal): pointer;
@@ -54,24 +54,17 @@ const
 constructor TSimpleBlockWriter.Create(const aFilename: string);
 begin
   fFilename := aFilename;
-  fBuf              := VirtualAlloc(nil, BUFFER_SIZE, MEM_RESERVE + MEM_COMMIT, PAGE_READWRITE);
+  SetLength(fBuf, BUFFER_SIZE);
   fBufOffs          := 0;
-  Win32Check(VirtualLock(fBuf, BUFFER_SIZE));
-  Win32Check(fBuf <> nil);
-  FillChar(fBuf^, BUFFER_SIZE, 0);
   fLock := TCriticalSection.Create();
-  fFile := CreateFile(PChar(fFilename), GENERIC_WRITE, 0, nil, CREATE_ALWAYS,
-                        FILE_ATTRIBUTE_NORMAL + FILE_FLAG_WRITE_THROUGH +
-                        FILE_FLAG_NO_BUFFERING, 0);
-  Win32Check(fFile <> INVALID_HANDLE_VALUE);
+  fFile := TFileStream.Create(fFilename, fmCreate,fmShareExclusive);
 end;
 
 destructor TSimpleBlockWriter.Destroy;
 begin
   Flush;
-  Win32Check(CloseHandle(fFile));
-  Win32Check(VirtualUnlock(fBuf, BUFFER_SIZE));
-  Win32Check(VirtualFree(fBuf, 0, MEM_RELEASE));
+  fFile.free;
+  SetLength(fBuf, 0);
   fLock.Free;
   inherited;
 end;
@@ -79,6 +72,11 @@ end;
 procedure TSimpleBlockWriter.EnterCriticalSection;
 begin
   fLock.Enter();
+end;
+
+procedure TSimpleBlockWriter.LeaveCriticalSection;
+begin
+  fLock.Leave;
 end;
 
 function TSimpleBlockWriter.OffsetPtr(ptr: pointer; offset: Cardinal): pointer;
@@ -139,16 +137,17 @@ var
   written: Cardinal;
 begin
   place := BUFFER_SIZE-fBufOffs;
-  if place <= count then begin
+  if place <= count then
+  begin
     Move(buf,OffsetPtr(fBuf,fBufOffs)^,place); // fill the buffer
     fBufOffs := BUFFER_SIZE;
     Flush;
     Dec(count,place);
     bufp := OffsetPtr(@buf,place);
-    while count >= BUFFER_SIZE do begin
-      Move(bufp^,fBuf^,BUFFER_SIZE);
-      res := WriteFile(fFile,fBuf^,BUFFER_SIZE,written,nil);
-      if not res then RaiseLastWin32Error;
+    while count >= BUFFER_SIZE do
+    begin
+      Move(bufp^,fBuf[0],BUFFER_SIZE);
+      written := fFile.Write(fBuf[0],BUFFER_SIZE);
       Dec(count,BUFFER_SIZE);
       bufp := OffsetPtr(bufp,BUFFER_SIZE);
     end; //while
@@ -165,14 +164,9 @@ procedure TSimpleBlockWriter.Flush;
 var
   written: Cardinal;
 begin
-  Win32Check(WriteFile(fFile, fBuf^, BUFFER_SIZE, written, nil));
+  written := fFile.Write(fBuf[0], BUFFER_SIZE);
   fBufOffs := 0;
-  FillChar(fBuf^, BUFFER_SIZE, 0);
-end;
-
-procedure TSimpleBlockWriter.LeaveCriticalSection;
-begin
-  fLock.Leave;
+  FillChar(fBuf[0], BUFFER_SIZE, 0);
 end;
 
 end.
