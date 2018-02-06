@@ -9,7 +9,26 @@ uses
   System.SysUtils,
   system.Syncobjs;
 
+var
+  profCompressTicks     : boolean;
+  profProcSize          : integer;
+  profCompressThreads   : boolean;
+  prfFreq        : Int64;
+
 type
+
+  // a record describing a proc enter/leave call
+  TProcInfoRec = record
+  public
+    Tag : byte;
+    Counter : Int64;
+    ThreadId : Cardinal;
+    procId : Integer;
+    Ticks : Int64;
+  end;
+
+  TOnRemapThreads = function(thread: integer): integer;
+
   TSimpleBlockWriter = class
   private
     fFilename    : string;
@@ -17,10 +36,15 @@ type
     fBufOffs     : integer;
     fFile        : TFileStream;
     fLock        : TCriticalSection;
+    prfLastTick    : int64;
+    fOnRemapThreads : tOnRemapThreads;
 
     function OffsetPtr(ptr: pointer; offset: Cardinal): pointer;
     procedure WriteToFile(const buf; count: Cardinal);
     procedure Flush();
+    procedure WriteTicks(ticks: int64);
+    procedure WriteThread(thread: cardinal);
+
   public
     constructor Create(const aFilename : string);
     destructor Destroy; override;
@@ -34,15 +58,23 @@ type
     procedure WriteBool  (const bool: boolean);
     procedure WriteAnsiString  (const value: ansistring);
 
+
+    procedure WriteHeader;
+    procedure WriteProcInfoRec(const aProcInfoRec : TProcInfoRec);
+
     procedure EnterCriticalSection();
     procedure LeaveCriticalSection();
+
+    property OnRemapThreads : TOnRemapThreads read fOnRemapThreads write fOnRemapThreads;
 
   end;
 
 
 implementation
 
-uses WinApi.Windows;
+uses
+  WinApi.Windows,
+  GpProfH;
 
 const
   BUFFER_SIZE = 64 * 1024;
@@ -58,6 +90,8 @@ begin
   fBufOffs          := 0;
   fLock := TCriticalSection.Create();
   fFile := TFileStream.Create(fFilename, fmCreate,fmShareExclusive);
+  prfLastTick         := -1;
+
 end;
 
 destructor TSimpleBlockWriter.Destroy;
@@ -84,6 +118,43 @@ begin
   Result := pointer(Cardinal(ptr)+offset);
 end;
 
+
+procedure TSimpleBlockWriter.WriteHeader;
+begin
+  WriteTag(PR_PRFVERSION);
+  WriteInt(PRF_VERSION);
+  WriteTag(PR_COMPTICKS);
+  WriteBool(profCompressTicks);
+  WriteTag(PR_COMPTHREADS);
+  WriteBool(profCompressThreads);
+  WriteTag(PR_FREQUENCY);
+  WriteTicks(prfFreq);
+  WriteTag(PR_PROCSIZE);
+  WriteInt(profProcSize);
+  WriteTag(PR_ENDHEADER);
+end; { WriteHeader }
+
+procedure TSimpleBlockWriter.WriteTicks(ticks: int64);
+type
+  TTick = array [1..8] of Byte;
+var
+  diff: integer;
+begin
+  if not profCompressTicks then
+    WriteInt64(ticks)
+  else begin
+    if prfLastTick = -1 then diff := 8
+    else begin
+      diff := 8;
+      while (diff > 0) and (TTick(ticks)[diff] = TTick(prfLastTick)[diff]) do
+        Dec(diff);
+      Inc(diff);
+    end;
+    WriteBuffer(diff, 1);
+    WriteBuffer(ticks, diff);
+    prfLastTick := ticks;
+  end;
+end; { WriteTicks }
 
 procedure TSimpleBlockWriter.WriteAnsiString(const value: ansistring);
 begin
@@ -123,6 +194,41 @@ procedure TSimpleBlockWriter.WriteInt64(const int: int64);
 begin
   WriteToFile(int, SizeOf(int64));
 end;
+
+procedure TSimpleBlockWriter.WriteProcInfoRec(const aProcInfoRec: TProcInfoRec);
+begin
+  if aProcInfoRec.Counter <> 0 then
+    WriteTicks(aProcInfoRec.Counter);
+  WriteTag(aProcInfoRec.Tag);
+  WriteThread(aProcInfoRec.ThreadId);
+  WriteID(aProcInfoRec.procId,profProcSize);
+  WriteTicks(aProcInfoRec.Ticks);
+end;
+
+procedure TSimpleBlockWriter.WriteThread(thread: cardinal);
+const
+  marker: integer = 0;
+var
+  remap: integer;
+begin
+  if not profCompressThreads then
+    WriteBuffer(thread, Sizeof(integer))
+  else
+  begin
+    if not Assigned(fOnRemapThreads) then
+      raise Exception.create('OnRemapThreads is not valid');
+    remap := fOnRemapThreads(thread);
+    //remap := prfThreads.Remap(thread);
+    if prfThreads.Count >= prfMaxThreadNum then begin
+      WriteBuffer(marker, prfThreadBytes);
+      prfMaxThreadNum := 2 * prfMaxThreadNum;
+      prfThreadBytes := prfThreadBytes + 1;
+    end;
+    WriteBuffer(remap, prfThreadBytes);
+  end;
+end; { WriteThread }
+
+
 
 procedure TSimpleBlockWriter.WriteTag(const tag: byte);
 begin

@@ -77,14 +77,13 @@ type
 
 var
   prfWriter      : TSimpleBlockWriter;
-  prfFreq        : TLargeInteger;
   prfCounter     : int64;
   prfDoneMsg     : integer;
   prfModuleName  : string;
   prfName        : string;
   prfRunning     : boolean;
-  prfLastTick    : Comp;
-  prfOnlyThread  : integer;
+
+  prfOnlyThread  : Cardinal;
   prfThreads     : TThreadList;
   prfThreadsInfo : TThreadInformationList;
   prfThreadBytes : integer;
@@ -92,68 +91,20 @@ var
   prfInitialized : boolean;
   prfDisabled    : boolean;
 
-  profProcSize          : integer;
-  profCompressTicks     : boolean;
-  profCompressThreads   : boolean;
+
+
   profProfilingAutostart: boolean;
   profPrfOutputFile     : string;
   profTableName         : string;
 
 
-procedure WriteTicks(ticks: int64);
-type
-  TTick = array [1..8] of Byte;
-var
-  diff: integer;
-begin
-  if not profCompressTicks then
-    prfWriter.WriteInt64(ticks)
-  else begin
-    if prfLastTick = -1 then diff := 8
-    else begin
-      diff := 8;
-      while (diff > 0) and (TTick(ticks)[diff] = TTick(prfLastTick)[diff]) do
-        Dec(diff);
-      Inc(diff);
-    end;
-    prfWriter.WriteBuffer(diff, 1);
-    prfWriter.WriteBuffer(ticks, diff);
-    prfLastTick := ticks;
-  end;
-end; { WriteTicks }
 
-procedure WriteThread(thread: integer);
-const
-  marker: integer = 0;
-var
-  remap: integer;
-begin
-  if not profCompressThreads then
-    prfWriter.WriteBuffer(thread, Sizeof(integer))
-  else
-  begin
-    remap := prfThreads.Remap(thread);
-    if prfThreads.Count >= prfMaxThreadNum then begin
-      prfWriter.WriteBuffer(marker, prfThreadBytes);
-      prfMaxThreadNum := 2 * prfMaxThreadNum;
-      prfThreadBytes := prfThreadBytes + 1;
-    end;
-    prfWriter.WriteBuffer(remap, prfThreadBytes);
-  end;
-end; { WriteThread }
-
-procedure FlushCounter;
-begin
-  if prfCounter <> 0 then begin
-    WriteTicks(prfCounter);
-    prfCounter := 0;
-  end;
-end; { FlushCounter }
 
 procedure profilerEnterProc(procID : integer);
 var
-  ct : integer;
-  cnt: TLargeinteger;
+  ct : Cardinal;
+  cnt: int64;
+  LProcInfoRec : TProcInfoRec:
 begin
   QueryPerformanceCounter(cnt);
   ct := GetCurrentThreadID;
@@ -162,11 +113,12 @@ begin
 {$B-}
     prfWriter.EnterCriticalSection();
     try
-      FlushCounter;
-      prfWriter.WriteTag(PR_ENTERPROC);
-      WriteThread(ct);
-      prfWriter.WriteID(procID,profProcSize);
-      WriteTicks(Cnt);
+      LProcInfoRec := Default(TProcInfoRec);
+      LProcInfoRec.Tag := PR_ENTERPROC;
+      LProcInfoRec.Counter := prfCounter;
+      LProcInfoRec.ThreadId := ct;
+      LProcInfoRec.procId := procID;
+      LProcInfoRec.Ticks := Cnt;
       QueryPerformanceCounter(prfCounter);
     finally
       prfWriter.LeaveCriticalSection();
@@ -186,11 +138,12 @@ begin
 {$B-}
     prfWriter.EnterCriticalSection();
     try
-      FlushCounter;
-      prfWriter.WriteTag(PR_EXITPROC);
-      WriteThread(ct);
-      prfWriter.WriteID(procID,profProcSize);
-      WriteTicks(Cnt);
+      LProcInfoRec := Default(TProcInfoRec);
+      LProcInfoRec.Tag := PR_EXITPROC;
+      LProcInfoRec.Counter := prfCounter;
+      LProcInfoRec.ThreadId := ct;
+      LProcInfoRec.procId := procID;
+      LProcInfoRec.Ticks := Cnt;
       QueryPerformanceCounter(prfCounter);
     finally
       prfWriter.LeaveCriticalSection();
@@ -214,7 +167,8 @@ procedure ProfilerStop;
 begin
   if not prfDisabled then begin
     prfWriter.EnterCriticalSection();
-    try prfRunning := false;
+    try
+      prfRunning := false;
     finally
       prfWriter.LeaveCriticalSection();
     end;
@@ -387,30 +341,16 @@ begin
     prfThreadsInfo      := TThreadInformationList.Create();
     prfMaxThreadNum     := 256;
     prfThreadBytes      := 1;
-    prfLastTick         := -1;
     prfDoneMsg          := RegisterWindowMessage(CMD_MESSAGE);
     prfName             := CombineNames(prfModuleName, 'prf');
     if profPrfOutputFile <> '' then
       prfName := profPrfOutputFile + '.prf';
     prfWriter := TSimpleBlockWriter.Create(prfName);
+    prfWriter.OnRemapThreads := prfThreads.Remap;
     QueryPerformanceFrequency(prfFreq);
   end;
 end; { Initialize }
 
-procedure WriteHeader;
-begin
-  prfWriter.WriteTag(PR_PRFVERSION);
-  prfWriter.WriteInt(PRF_VERSION);
-  prfWriter.WriteTag(PR_COMPTICKS);
-  prfWriter.WriteBool(profCompressTicks);
-  prfWriter.WriteTag(PR_COMPTHREADS);
-  prfWriter.WriteBool(profCompressThreads);
-  prfWriter.WriteTag(PR_FREQUENCY);
-  WriteTicks(prfFreq);
-  prfWriter.WriteTag(PR_PROCSIZE);
-  prfWriter.WriteInt(profProcSize);
-  prfWriter.WriteTag(PR_ENDHEADER);
-end; { WriteHeader }
 
 procedure CopyTables;
 var
@@ -483,7 +423,7 @@ initialization
   prfInitialized := false;
   Initialize;
   if not prfDisabled then begin
-    WriteHeader;
+    prfWriter.WriteHeader;
     CopyTables;
     WriteCalibration;
     prfWriter.WriteTag(PR_STARTDATA);
