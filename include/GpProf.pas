@@ -37,13 +37,25 @@ uses
   Windows,
   SysUtils,
   IniFiles,
-  GpProfWriter,
   GpProfH,
-  GpProfCommon;
+  gpprofCommon,
+  gpprofWriter;
 
+const
+  BUF_SIZE = 64 * 1024; //64*1024;
 
 type
+{$IFNDEF VER100}{$IFNDEF VER110}{$DEFINE NeedTLI}{$ENDIF}{$ENDIF}
+{$IFDEF NeedTLI}
+  TInt64 = int64;
+  TLargeInteger = record
+    case integer of
+      0: (LowPart: DWord; HighPart: LongInt);
+      1: (QuadPart: Comp);
+  end;
+{$ELSE}
   TInt64 = TLargeInteger;
+{$ENDIF}
 
   TTLEl = record
     tleThread: integer;
@@ -64,7 +76,7 @@ type
   public
     constructor Create;
     destructor  Destroy; override;
-    function    Remap(const aThread: Cardinal; out aThreadCount: integer): integer;
+    function    Remap(thread: integer): integer;
     property    Count: integer read tlCount;
   end;
 
@@ -76,51 +88,158 @@ type
   TThreadInformationList = TObjectList<TThreadInformation>;
 
 var
-  prfWriter      : TSimpleBlockWriter;
-  prfCounter     : int64;
+  prfFile        : TSimpleBlockWriter;
+  prfLock        : TRTLCriticalSection;
+  prfFreq        : TLargeInteger;
+  prfCounter     : TLargeInteger;
   prfDoneMsg     : integer;
   prfModuleName  : string;
   prfName        : string;
-
-  prfOnlyThread  : Cardinal;
+  prfRunning     : boolean;
+  prfLastTick    : Comp;
+  prfOnlyThread  : integer;
   prfThreads     : TThreadList;
   prfThreadsInfo : TThreadInformationList;
+  prfThreadBytes : integer;
+  prfMaxThreadNum: integer;
   prfInitialized : boolean;
   prfDisabled    : boolean;
 
-
-
+  profProcSize          : integer;
+  profCompressTicks     : boolean;
+  profCompressThreads   : boolean;
   profProfilingAutostart: boolean;
   profPrfOutputFile     : string;
   profTableName         : string;
 
+{$IFDEF VER90}
+type
+  EWin32Error = class(Exception)
+  public
+    ErrorCode : DWord;
+  end;
 
+const
+  SWin32Error    = 'Win32 Error.  Code: %d.'#10'%s';
+  SUnkWin32Error = 'A Win32 API function failed';
 
+procedure RaiseLastWin32Error;
+var
+  LastError: DWord;
+  error    : EWin32Error;
+begin
+  LastError := GetLastError;
+  if LastError <> ERROR_SUCCESS then
+    error := EWin32Error.CreateFmt(SWin32Error, [LastError, SysErrorMessage(LastError)])
+  else
+    error := EWin32Error.Create(SUnkWin32Error);
+  error.ErrorCode := LastError;
+  raise error;
+end;
+
+{ Win32Check }
+
+function Win32Check(RetVal: BOOL): BOOL;
+begin
+  if not RetVal then
+    RaiseLastWin32Error;
+  Result := RetVal;
+end;
+{$ENDIF VER90}
+
+procedure FlushFile;
+begin
+  prfFile.Flush
+end; { FlushFile }
+
+function OffsetPtr(ptr: pointer; offset: DWORD): pointer;
+begin
+  Result := pointer(DWORD(ptr)+offset);
+end; { OffsetPtr }
+
+procedure Transmit(const buf; count: DWORD);
+begin
+  prfFile.WriteToFile(buf,count);
+end; { Transmit }
+
+procedure WriteInt   (int: integer);  begin Transmit(int, SizeOf(integer)); end;
+procedure WriteCardinal   (value: Cardinal);  begin Transmit(value, SizeOf(Cardinal)); end;
+procedure WriteTag   (tag: byte);     begin Transmit(tag, SizeOf(byte)); end;
+procedure WriteID    (id: integer);   begin Transmit(id, profProcSize); end;
+procedure WriteBool  (bool: boolean); begin Transmit(bool, 1); end;
+procedure WriteAnsiString  (value: ansistring);
+begin
+  WriteCardinal(Length(value));
+  if Length(Value)>0 then
+    Transmit(value[1], Length(value));
+end;
+
+procedure WriteTicks(ticks: Comp);
+type
+  TTick = array [1..8] of Byte;
+var
+  diff: integer;
+begin
+  if not profCompressTicks then Transmit(ticks, Sizeof(Comp))
+  else begin
+    if prfLastTick = -1 then diff := 8
+    else begin
+      diff := 8;
+      while (diff > 0) and (TTick(ticks)[diff] = TTick(prfLastTick)[diff]) do
+        Dec(diff);
+      Inc(diff);
+    end;
+    Transmit(diff, 1);
+    Transmit(ticks, diff);
+    prfLastTick := ticks;
+  end;
+end; { WriteTicks }
+
+procedure WriteThread(thread: integer);
+const
+  marker: integer = 0;
+var
+  remap: integer;
+begin
+  if not profCompressThreads then Transmit(thread, Sizeof(integer))
+  else begin
+    remap := prfThreads.Remap(thread);
+    if prfThreads.Count >= prfMaxThreadNum then begin
+      Transmit(marker, prfThreadBytes);
+      prfMaxThreadNum := 2 * prfMaxThreadNum;
+      prfThreadBytes := prfThreadBytes + 1;
+    end;
+    Transmit(remap, prfThreadBytes);
+  end;
+end; { WriteThread }
+
+procedure FlushCounter;
+begin
+  if prfCounter.QuadPart <> 0 then begin
+    WriteTicks(prfCounter.QuadPart);
+    prfCounter.QuadPart := 0;
+  end;
+end; { FlushCounter }
 
 procedure profilerEnterProc(procID : integer);
 var
-  ct : Cardinal;
-  cnt: int64;
-  LProcInfoRec : TProcInfoRec;
+  ct : integer;
+  cnt: TLargeinteger;
 begin
-  QueryPerformanceCounter(cnt);
+  QueryPerformanceCounter(TInt64((@cnt)^));
   ct := GetCurrentThreadID;
 {$B+}
   if prfRunning and ((prfOnlyThread = 0) or (prfOnlyThread = ct)) then begin
 {$B-}
-    prfWriter.EnterCriticalSection();
+    EnterCriticalSection(prfLock);
     try
-      LProcInfoRec := Default(TProcInfoRec);
-      LProcInfoRec.Tag := PR_ENTERPROC;
-      LProcInfoRec.Counter := prfCounter;
-      LProcInfoRec.ThreadId := ct;
-      LProcInfoRec.procId := procID;
-      LProcInfoRec.Ticks := Cnt;
-      prfWriter.WriteProcInfoRec(LProcInfoRec);
-      QueryPerformanceCounter(prfCounter);
-    finally
-      prfWriter.LeaveCriticalSection();
-    end;
+      FlushCounter;
+      WriteTag(PR_ENTERPROC);
+      WriteThread(ct);
+      WriteID(procID);
+      WriteTicks(Cnt.QuadPart);
+      QueryPerformanceCounter(TInt64((@prfCounter)^));
+    finally LeaveCriticalSection(prfLock); end;
   end;
 end; { ProfilerEnterProc }
 
@@ -128,62 +247,49 @@ procedure ProfilerExitProc(procID : integer);
 var
   ct : integer;
   cnt: TLargeinteger;
-  LProcInfoRec : TProcInfoRec;
 begin
-  QueryPerformanceCounter(Cnt);
+  QueryPerformanceCounter(TInt64((@Cnt)^));
   ct := GetCurrentThreadID;
 {$B+}
   if prfRunning and ((prfOnlyThread = 0) or (prfOnlyThread = ct)) then begin
 {$B-}
-    prfWriter.EnterCriticalSection();
+    EnterCriticalSection(prfLock);
     try
-      LProcInfoRec := Default(TProcInfoRec);
-      LProcInfoRec.Tag := PR_EXITPROC;
-      LProcInfoRec.Counter := prfCounter;
-      LProcInfoRec.ThreadId := ct;
-      LProcInfoRec.procId := procID;
-      LProcInfoRec.Ticks := Cnt;
-      prfWriter.WriteProcInfoRec(LProcInfoRec);
-      QueryPerformanceCounter(prfCounter);
-    finally
-      prfWriter.LeaveCriticalSection();
-    end;
+      FlushCounter;
+      WriteTag(PR_EXITPROC);
+      WriteThread(ct);
+      WriteID(procID);
+      WriteTicks(Cnt.QuadPart);
+      QueryPerformanceCounter(TInt64((@prfCounter)^));
+    finally LeaveCriticalSection(prfLock); end;
   end;
 end; { ProfilerExitProc }
 
 procedure ProfilerStart;
 begin
   if not prfDisabled then begin
-    prfWriter.EnterCriticalSection();
-    try
-      prfRunning := true;
-    finally
-      prfWriter.LeaveCriticalSection();
-    end;
+    EnterCriticalSection(prfLock);
+    try prfRunning := true;
+    finally LeaveCriticalSection(prfLock); end;
   end;
 end; { ProfilerStart }
 
 procedure ProfilerStop;
 begin
   if not prfDisabled then begin
-    prfWriter.EnterCriticalSection();
-    try
-      prfRunning := false;
-    finally
-      prfWriter.LeaveCriticalSection();
-    end;
+    EnterCriticalSection(prfLock);
+    try prfRunning := false;
+    finally LeaveCriticalSection(prfLock); end;
   end;
 end; { ProfilerStop }
 
 procedure ProfilerStartThread;
 begin
-  prfWriter.EnterCriticalSection();
+  EnterCriticalSection(prfLock);
   try
     prfRunning := true;
     prfOnlyThread := GetCurrentThreadID;
-  finally
-    prfWriter.LeaveCriticalSection();
-  end;
+  finally LeaveCriticalSection(prfLock); end;
 end; { ProfilerStartThread }
 
 function CombineNames(fName, newExt: string): string;
@@ -229,14 +335,14 @@ begin
   inherited Destroy;
 end; { TThreadList.Destroy }
 
-function TThreadList.Remap(const aThread: Cardinal; out aThreadCount: integer): integer;
+function TThreadList.Remap(thread: integer): integer;
 var
   remap   : integer;
   insert  : integer;
   tmpItems: PTLElements;
 begin
-  if athread = tlLast then Result := tlLastR
-  else if not Search(athread, remap, insert) then begin
+  if thread = tlLast then Result := tlLastR
+  else if not Search(thread, remap, insert) then begin
     // reallocate tlItems
     GetMem(tmpItems, SizeOf(TTLEl)*(tlCount+1));
     if tlItems <> nil then begin
@@ -251,20 +357,19 @@ begin
     if insert < tlCount then
       Move(tlItems^[insert], tlItems^[insert + 1], (tlCount-insert)*SizeOf(TTLEl));
     with tlItems^[Insert] do begin
-      tleThread := athread;
+      tleThread := thread;
       tleRemap  := tlRemap;
     end;
     Inc(tlCount);
-    tlLast  := athread;
+    tlLast  := thread;
     tlLastR := tlRemap;
     Result  := tlRemap;
   end
   else begin
-    tlLast  := athread;
+    tlLast  := thread;
     tlLastR := remap;
     Result  := remap;
   end;
-  aThreadCount := prfThreads.Count;
 end; { TThreadList.Remap }
 
 function TThreadList.Search(thread: integer; var remap, insertIdx: integer): boolean;
@@ -336,20 +441,37 @@ begin
   ReadIncSettings;
   if not prfDisabled then begin
     prfRunning          := profProfilingAutostart;
-    prfCounter          := 0;
+    prfCounter.QuadPart := 0;
     prfOnlyThread       := 0;
     prfThreads          := TThreadList.Create;
     prfThreadsInfo      := TThreadInformationList.Create();
+    prfMaxThreadNum     := 256;
+    prfThreadBytes      := 1;
+    prfLastTick         := -1;
     prfDoneMsg          := RegisterWindowMessage(CMD_MESSAGE);
     prfName             := CombineNames(prfModuleName, 'prf');
     if profPrfOutputFile <> '' then
       prfName := profPrfOutputFile + '.prf';
-    prfWriter := TSimpleBlockWriter.Create(prfName);
-    prfWriter.OnRemapThreads := prfThreads.Remap;
-    QueryPerformanceFrequency(prfFreq);
+    InitializeCriticalSection(prfLock);
+    prfFile := TSimpleBlockWriter.Create(prfName);
+    QueryPerformanceFrequency(TInt64((@prfFreq)^));
   end;
 end; { Initialize }
 
+procedure WriteHeader;
+begin
+  WriteTag(PR_PRFVERSION);
+  WriteInt(PRF_VERSION);
+  WriteTag(PR_COMPTICKS);
+  WriteBool(profCompressTicks);
+  WriteTag(PR_COMPTHREADS);
+  WriteBool(profCompressThreads);
+  WriteTag(PR_FREQUENCY);
+  WriteTicks(prfFreq.QuadPart);
+  WriteTag(PR_PROCSIZE);
+  WriteInt(profProcSize);
+  WriteTag(PR_ENDHEADER);
+end; { WriteHeader }
 
 procedure CopyTables;
 var
@@ -364,7 +486,7 @@ begin
       GetMem(p,FileSize(f));
       try
         BlockRead(f,p^,FileSize(f));
-        prfWriter.WriteBuffer(p^,FileSize(f));
+        Transmit(p^,FileSize(f));
       finally FreeMem(p); end;
     finally Close(f); end;
   end;
@@ -377,23 +499,23 @@ var
 begin
   run := prfRunning;
   prfRunning := True;
-  prfWriter.WriteTag(PR_STARTCALIB);
-  prfWriter.WriteInt(CALIB_CNT);
+  WriteTag(PR_STARTCALIB);
+  WriteInt(CALIB_CNT);
   for i := 1 to CALIB_CNT + 1 do begin
     ProfilerEnterProc(0);
     ProfilerExitProc(0);
   end;
-  prfWriter.Flush;
-  prfWriter.WriteTag(PR_ENDCALIB);
+  FlushCounter;
+  WriteTag(PR_ENDCALIB);
   prfRunning := run;
 end; { WriteCalibration }
 
 procedure Finalize;
 begin
-  prfWriter.Flush;
-  prfWriter.Free;
+  prfFile.free;
   prfThreads.Free;
   prfThreadsInfo.free;
+  DeleteCriticalSection(prfLock);
   PostMessage(HWND_BROADCAST, prfDoneMsg, CMD_DONE, 0);
 end; { Finalize }
 
@@ -403,17 +525,17 @@ begin
   if not prfInitialized then Exit;
   ProfilerStop;
   prfInitialized := False;
-  prfWriter.Flush;
-  prfWriter.WriteTag(PR_ENDDATA);
+  FlushCounter;
+  WriteTag(PR_ENDDATA);
 
-  prfWriter.WriteTag(PR_START_THREADINFO);
-  prfWriter.WriteCardinal(prfThreadsInfo.count);
+  WriteTag(PR_START_THREADINFO);
+  WriteCardinal(prfThreadsInfo.count);
   for i := 0 to prfThreadsInfo.count-1 do
   begin
-    prfWriter.WriteCardinal(prfThreadsInfo[i].ID);
-    prfWriter.WriteAnsiString(prfThreadsInfo[i].Name);
+    WriteCardinal(prfThreadsInfo[i].ID);
+    WriteAnsiString(prfThreadsInfo[i].Name);
   end;
-  prfWriter.WriteInt(PR_END_THREADINFO);
+  WriteInt(PR_END_THREADINFO);
   Finalize;
 
 end; { ProfilerTerminate }
@@ -423,14 +545,13 @@ initialization
   prfInitialized := false;
   Initialize;
   if not prfDisabled then begin
-    prfWriter.WriteHeader;
+    WriteHeader;
     CopyTables;
     WriteCalibration;
-    prfWriter.WriteTag(PR_STARTDATA);
+    WriteTag(PR_STARTDATA);
     prfInitialized := true;
-    gpprof.NameThreadForDebugging('Main Application Thread', MainThreadID);
+    NameThreadForDebugging('Main Application Thread', MainThreadID);
   end;
 finalization
   ProfilerTerminate;
 end.
-
