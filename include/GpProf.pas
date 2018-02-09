@@ -64,7 +64,7 @@ type
   public
     constructor Create;
     destructor  Destroy; override;
-    function    Remap(thread: integer): integer;
+    function    Remap(const aThread: Cardinal; out aThreadCount: integer): integer;
     property    Count: integer read tlCount;
   end;
 
@@ -81,13 +81,10 @@ var
   prfDoneMsg     : integer;
   prfModuleName  : string;
   prfName        : string;
-  prfRunning     : boolean;
 
   prfOnlyThread  : Cardinal;
   prfThreads     : TThreadList;
   prfThreadsInfo : TThreadInformationList;
-  prfThreadBytes : integer;
-  prfMaxThreadNum: integer;
   prfInitialized : boolean;
   prfDisabled    : boolean;
 
@@ -104,7 +101,7 @@ procedure profilerEnterProc(procID : integer);
 var
   ct : Cardinal;
   cnt: int64;
-  LProcInfoRec : TProcInfoRec:
+  LProcInfoRec : TProcInfoRec;
 begin
   QueryPerformanceCounter(cnt);
   ct := GetCurrentThreadID;
@@ -119,6 +116,7 @@ begin
       LProcInfoRec.ThreadId := ct;
       LProcInfoRec.procId := procID;
       LProcInfoRec.Ticks := Cnt;
+      prfWriter.WriteProcInfoRec(LProcInfoRec);
       QueryPerformanceCounter(prfCounter);
     finally
       prfWriter.LeaveCriticalSection();
@@ -130,6 +128,7 @@ procedure ProfilerExitProc(procID : integer);
 var
   ct : integer;
   cnt: TLargeinteger;
+  LProcInfoRec : TProcInfoRec;
 begin
   QueryPerformanceCounter(Cnt);
   ct := GetCurrentThreadID;
@@ -144,6 +143,7 @@ begin
       LProcInfoRec.ThreadId := ct;
       LProcInfoRec.procId := procID;
       LProcInfoRec.Ticks := Cnt;
+      prfWriter.WriteProcInfoRec(LProcInfoRec);
       QueryPerformanceCounter(prfCounter);
     finally
       prfWriter.LeaveCriticalSection();
@@ -229,14 +229,14 @@ begin
   inherited Destroy;
 end; { TThreadList.Destroy }
 
-function TThreadList.Remap(thread: integer): integer;
+function TThreadList.Remap(const aThread: Cardinal; out aThreadCount: integer): integer;
 var
   remap   : integer;
   insert  : integer;
   tmpItems: PTLElements;
 begin
-  if thread = tlLast then Result := tlLastR
-  else if not Search(thread, remap, insert) then begin
+  if athread = tlLast then Result := tlLastR
+  else if not Search(athread, remap, insert) then begin
     // reallocate tlItems
     GetMem(tmpItems, SizeOf(TTLEl)*(tlCount+1));
     if tlItems <> nil then begin
@@ -251,19 +251,20 @@ begin
     if insert < tlCount then
       Move(tlItems^[insert], tlItems^[insert + 1], (tlCount-insert)*SizeOf(TTLEl));
     with tlItems^[Insert] do begin
-      tleThread := thread;
+      tleThread := athread;
       tleRemap  := tlRemap;
     end;
     Inc(tlCount);
-    tlLast  := thread;
+    tlLast  := athread;
     tlLastR := tlRemap;
     Result  := tlRemap;
   end
   else begin
-    tlLast  := thread;
+    tlLast  := athread;
     tlLastR := remap;
     Result  := remap;
   end;
+  aThreadCount := prfThreads.Count;
 end; { TThreadList.Remap }
 
 function TThreadList.Search(thread: integer; var remap, insertIdx: integer): boolean;
@@ -339,8 +340,6 @@ begin
     prfOnlyThread       := 0;
     prfThreads          := TThreadList.Create;
     prfThreadsInfo      := TThreadInformationList.Create();
-    prfMaxThreadNum     := 256;
-    prfThreadBytes      := 1;
     prfDoneMsg          := RegisterWindowMessage(CMD_MESSAGE);
     prfName             := CombineNames(prfModuleName, 'prf');
     if profPrfOutputFile <> '' then
@@ -384,13 +383,14 @@ begin
     ProfilerEnterProc(0);
     ProfilerExitProc(0);
   end;
-  FlushCounter;
+  prfWriter.Flush;
   prfWriter.WriteTag(PR_ENDCALIB);
   prfRunning := run;
 end; { WriteCalibration }
 
 procedure Finalize;
 begin
+  prfWriter.Flush;
   prfWriter.Free;
   prfThreads.Free;
   prfThreadsInfo.free;
@@ -403,7 +403,7 @@ begin
   if not prfInitialized then Exit;
   ProfilerStop;
   prfInitialized := False;
-  FlushCounter;
+  prfWriter.Flush;
   prfWriter.WriteTag(PR_ENDDATA);
 
   prfWriter.WriteTag(PR_START_THREADINFO);
