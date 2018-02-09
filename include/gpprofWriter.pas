@@ -7,7 +7,8 @@ interface
 uses
   System.classes,
   System.SysUtils,
-  system.Syncobjs;
+  system.Syncobjs,
+  System.Generics.Collections;
 
 var
   profCompressTicks     : boolean;
@@ -17,8 +18,15 @@ var
   prfRunning     : boolean;
 
 type
+  TAsyncJob = class
+  public
+    Buffer : Pointer;
+    Length : Integer;
+    constructor Create(const aSize : Integer);
+    destructor Destroy;override;
+  end;
 
-  TSimpleBlockWriter = class
+  TSimpleBlockWriter = class(TThread)
   private
     fFilename    : string;
     fBuf         : pointer;
@@ -28,15 +36,21 @@ type
     fLastTick    : int64;
     fThreadBytes : integer;
     fMaxThreadNum: integer;
-
+    fAsyncQueue  : TObjectQueue<TAsyncJob>;
+    fAsyncQueueLock : TCriticalSection;
+    fAsyncQueueEvent : TEvent;
+    fShutdown : Boolean;
     function OffsetPtr(ptr: pointer; offset: Cardinal): pointer;
+    procedure WriteToFileImpl(const buf; count: Cardinal);
+    procedure Flush();
+  protected
+    procedure Execute; override;
   public
     constructor Create(const aFilename : string);
     destructor Destroy; override;
-
-
     procedure WriteToFile(const buf; count: Cardinal);
-    procedure Flush();
+    procedure ForceFlush();
+    procedure ShutDown;
   end;
 
 
@@ -55,6 +69,7 @@ const
 
 constructor TSimpleBlockWriter.Create(const aFilename: string);
 begin
+  inherited Create(True);
   fFilename := aFilename;
   fBuf              := VirtualAlloc(nil, BUF_SIZE, MEM_RESERVE + MEM_COMMIT, PAGE_READWRITE);
   fBufOffs          := 0;
@@ -69,17 +84,59 @@ begin
   fLastTick         := -1;
   fThreadBytes      := 1;
   fMaxThreadNum     := 256;
-
+  fAsyncQueue := TObjectQueue<TAsyncJob>.Create();
+  fAsyncQueueLock := TCriticalSection.Create();
+  fAsyncQueueEvent := TEvent.Create();
 end;
 
 destructor TSimpleBlockWriter.Destroy;
 begin
   Flush;
+  fAsyncQueueEvent.Free;
+  fAsyncQueueLock.Free;
+  fAsyncQueue.free;
   Win32Check(CloseHandle(fFile));
   Win32Check(VirtualUnlock(fBuf, BUF_SIZE));
   Win32Check(VirtualFree(fBuf, 0, MEM_RELEASE));
   fLock.Free;
   inherited;
+end;
+
+procedure TSimpleBlockWriter.Execute;
+var
+  LWaitForResult : TWaitResult;
+  LJob : TAsyncJob;
+  LKeepRunning : Boolean;
+begin
+  try
+    NameThreadForDebugging('GPProf writer thread');
+    LKeepRunning := true;
+    while (LKeepRunning) do
+    begin
+      //LWaitForResult := fAsyncQueueEvent.WaitFor(1);
+      //if LWaitForResult = TWaitResult.wrSignaled then
+      begin
+        LKeepRunning := True;
+        fAsyncQueueLock.Acquire;
+        if fAsyncQueue.Count = 0 then
+        begin
+          // go back to sleep until next package arrives
+          fAsyncQueueEvent.ResetEvent;
+          if fShutdown then
+            LKeepRunning := False;
+        end
+        else
+        begin
+          LJob := fAsyncQueue.Peek();
+          WriteToFileImpl(LJob.Buffer^, LJob.Length);
+          fAsyncQueue.Dequeue; // free the entry and remove it
+        end;
+        fAsyncQueueLock.Release;
+      end;
+      Sleep(0); // avoid burning CPU
+    end;
+  except
+  end;
 end;
 
 function TSimpleBlockWriter.OffsetPtr(ptr: pointer; offset: Cardinal): pointer;
@@ -88,7 +145,33 @@ begin
 end;
 
 
+procedure TSimpleBlockWriter.ShutDown;
+begin
+  fShutdown := true;
+end;
+
 procedure TSimpleBlockWriter.WriteToFile(const buf; count: Cardinal);
+var LJob : TAsyncJob;
+begin
+  if count = 0 then
+    Exit;
+  if not Self.Started then
+  begin
+    WriteToFileImpl(buf,count);
+  end
+  else
+  begin
+    // create job for async execution; wake up thread
+    LJob := TAsyncJob.Create(count);
+    move(buf,LJob.Buffer^,count);
+    fAsyncQueueLock.Acquire;
+    fAsyncQueue.Enqueue(LJob);
+    fAsyncQueueLock.Release;
+    fAsyncQueueEvent.SetEvent;
+  end;
+end;
+
+procedure TSimpleBlockWriter.WriteToFileImpl(const buf; count: Cardinal);
 var
   res    : boolean;
   place  : Cardinal;
@@ -127,6 +210,27 @@ begin
   Win32Check(WriteFile(fFile, fBuf^, BUF_SIZE, written, nil));
   fBufOffs := 0;
   FillChar(fBuf^, BUF_SIZE, 0);
+end;
+
+procedure TSimpleBlockWriter.ForceFlush;
+begin
+  if not Started then
+    Flush;
+end;
+
+{ TAsyncJob }
+
+constructor TAsyncJob.Create(const aSize : Integer);
+begin
+  GetMem(Buffer,aSize);
+  Length := aSize;
+end;
+
+destructor TAsyncJob.Destroy;
+begin
+  if Assigned(Buffer) then
+    FreeMem(Buffer, Length);
+  inherited;
 end;
 
 end.

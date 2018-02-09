@@ -149,7 +149,7 @@ end;
 
 procedure FlushFile;
 begin
-  prfFile.Flush
+  prfFile.ForceFlush
 end; { FlushFile }
 
 function OffsetPtr(ptr: pointer; offset: DWORD): pointer;
@@ -454,6 +454,7 @@ begin
       prfName := profPrfOutputFile + '.prf';
     InitializeCriticalSection(prfLock);
     prfFile := TSimpleBlockWriter.Create(prfName);
+    prfFile.Start;
     QueryPerformanceFrequency(TInt64((@prfFreq)^));
   end;
 end; { Initialize }
@@ -512,6 +513,10 @@ end; { WriteCalibration }
 
 procedure Finalize;
 begin
+  prfFile.ForceFlush;
+  prfFile.ShutDown;
+  if prfFile.Started then
+    prfFile.WaitFor;
   prfFile.free;
   prfThreads.Free;
   prfThreadsInfo.free;
