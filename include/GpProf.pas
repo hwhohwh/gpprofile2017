@@ -104,6 +104,7 @@ var
   prfMaxThreadNum: integer;
   prfInitialized : boolean;
   prfDisabled    : boolean;
+  prfUseAsyncWriter : Boolean;
 
   profProcSize          : integer;
   profCompressTicks     : boolean;
@@ -428,6 +429,7 @@ begin
           profProfilingAutostart := ReadBool('Performance','ProfilingAutostart',true);
           profPrfOutputFile := ReadString('Output','PrfOutputFilename','$(ModulePath)');
           profPrfOutputFile := ResolvePrfRuntimePlaceholders(profPrfOutputFile);
+          prfUseAsyncWriter      := ReadBool('Performance','UseAsyncWriter',false);
           prfDisabled            := false;
         end;
       end;
@@ -454,7 +456,8 @@ begin
       prfName := profPrfOutputFile + '.prf';
     InitializeCriticalSection(prfLock);
     prfFile := TSimpleBlockWriter.Create(prfName);
-    prfFile.Start;
+    if prfUseAsyncWriter then
+      prfFile.Start;
     QueryPerformanceFrequency(TInt64((@prfFreq)^));
   end;
 end; { Initialize }
