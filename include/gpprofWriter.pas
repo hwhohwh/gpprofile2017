@@ -36,9 +36,7 @@ type
     fLastTick    : int64;
     fThreadBytes : integer;
     fMaxThreadNum: integer;
-    fAsyncQueue  : TObjectQueue<TAsyncJob>;
-    fAsyncQueueLock : TCriticalSection;
-    fAsyncQueueEvent : TEvent;
+    fAsyncQueue  : TThreadedQueue<TAsyncJob>;
     fShutdown : Boolean;
     function OffsetPtr(ptr: pointer; offset: Cardinal): pointer;
     procedure WriteToFileImpl(const buf; count: Cardinal);
@@ -55,6 +53,10 @@ type
 
 
 implementation
+
+{$WARN SYMBOL_PLATFORM OFF}
+{$WARN SYMBOL_DEPRECATED OFF}
+
 
 uses
   WinApi.Windows,
@@ -84,16 +86,12 @@ begin
   fLastTick         := -1;
   fThreadBytes      := 1;
   fMaxThreadNum     := 256;
-  fAsyncQueue := TObjectQueue<TAsyncJob>.Create();
-  fAsyncQueueLock := TCriticalSection.Create();
-  fAsyncQueueEvent := TEvent.Create();
+  fAsyncQueue := TThreadedQueue<TAsyncJob>.Create();
 end;
 
 destructor TSimpleBlockWriter.Destroy;
 begin
   Flush;
-  fAsyncQueueEvent.Free;
-  fAsyncQueueLock.Free;
   fAsyncQueue.free;
   Win32Check(CloseHandle(fFile));
   Win32Check(VirtualUnlock(fBuf, BUF_SIZE));
@@ -104,7 +102,6 @@ end;
 
 procedure TSimpleBlockWriter.Execute;
 var
-  LWaitForResult : TWaitResult;
   LJob : TAsyncJob;
   LKeepRunning : Boolean;
 begin
@@ -113,27 +110,22 @@ begin
     LKeepRunning := true;
     while (LKeepRunning) do
     begin
-      //LWaitForResult := fAsyncQueueEvent.WaitFor(1);
-      //if LWaitForResult = TWaitResult.wrSignaled then
+      LKeepRunning := True;
+      if fAsyncQueue.QueueSize = 0 then
+        LJob := nil
+      else
+        LJob := fAsyncQueue.PopItem();
+      // go back to sleep until next package arrives
+      if not Assigned(LJob) then
       begin
-        LKeepRunning := True;
-        fAsyncQueueLock.Acquire;
-        if fAsyncQueue.Count = 0 then
-        begin
-          // go back to sleep until next package arrives
-          fAsyncQueueEvent.ResetEvent;
-          if fShutdown then
-            LKeepRunning := False;
-        end
-        else
-        begin
-          LJob := fAsyncQueue.Peek();
-          WriteToFileImpl(LJob.Buffer^, LJob.Length);
-          fAsyncQueue.Dequeue; // free the entry and remove it
-        end;
-        fAsyncQueueLock.Release;
+        if fShutdown then
+          LKeepRunning := False;
+      end
+      else
+      begin
+        WriteToFileImpl(LJob.Buffer^, LJob.Length);
+        LJob.Free;
       end;
-      Sleep(0); // avoid burning CPU
     end;
   except
   end;
@@ -164,10 +156,7 @@ begin
     // create job for async execution; wake up thread
     LJob := TAsyncJob.Create(count);
     move(buf,LJob.Buffer^,count);
-    fAsyncQueueLock.Acquire;
-    fAsyncQueue.Enqueue(LJob);
-    fAsyncQueueLock.Release;
-    fAsyncQueueEvent.SetEvent;
+    fAsyncQueue.PushItem(LJob);
   end;
 end;
 
