@@ -18,6 +18,16 @@ var
   prfRunning     : boolean;
 
 type
+
+  PProcInfo = ^TProcInfo;
+  TProcInfo = record
+    Counter : comp;
+    Tag : Byte;
+    Thread  : Cardinal;
+    ID : Integer;
+    Ticks : comp;
+  end;
+
   TAsyncJob = class
   public
     Buffer : Pointer;
@@ -38,8 +48,11 @@ type
     fMaxThreadNum: integer;
     fAsyncQueue  : TThreadedQueue<TAsyncJob>;
     fShutdown : Boolean;
+    fExceptionMsg : string;
     function OffsetPtr(ptr: pointer; offset: Cardinal): pointer;
-    procedure WriteToFileImpl(const buf; count: Cardinal);
+    procedure WriteToFileBuffered(const buf; count: Cardinal);
+    procedure WriteToFileDirect(const buf; count: Cardinal);
+
     procedure Flush();
   protected
     procedure Execute; override;
@@ -47,8 +60,12 @@ type
     constructor Create(const aFilename : string);
     destructor Destroy; override;
     procedure WriteToFile(const buf; count: Cardinal);
+    procedure WriteProcToFile(const aProcInfo : PProcInfo);
+
     procedure ForceFlush();
     procedure ShutDown;
+
+    property ExceptionMsg : string read fExceptionMsg;
   end;
 
 
@@ -111,10 +128,7 @@ begin
     while (LKeepRunning) do
     begin
       LKeepRunning := True;
-      if fAsyncQueue.QueueSize = 0 then
-        LJob := nil
-      else
-        LJob := fAsyncQueue.PopItem();
+      LJob := fAsyncQueue.PopItem();
       // go back to sleep until next package arrives
       if not Assigned(LJob) then
       begin
@@ -123,11 +137,14 @@ begin
       end
       else
       begin
-        WriteToFileImpl(LJob.Buffer^, LJob.Length);
+        WriteToFileDirect(LJob.Buffer^, LJob.Length);
         LJob.Free;
       end;
     end;
-  except
+  except on e: Exception do
+    begin
+      fExceptionMsg := e.Message;
+    end;
   end;
 end;
 
@@ -149,10 +166,12 @@ begin
     Exit;
   if not Self.Started then
   begin
-    WriteToFileImpl(buf,count);
+    WriteToFileBuffered(buf,count);
   end
   else
   begin
+    if fExceptionMsg <> '' then
+      raise Exception.Create(fExceptionMsg);
     // create job for async execution; wake up thread
     LJob := TAsyncJob.Create(count);
     move(buf,LJob.Buffer^,count);
@@ -160,7 +179,14 @@ begin
   end;
 end;
 
-procedure TSimpleBlockWriter.WriteToFileImpl(const buf; count: Cardinal);
+
+procedure TSimpleBlockWriter.WriteProcToFile(const aProcInfo : PProcInfo);
+var LJob : TAsyncJob;
+begin
+  WriteToFile(aProcInfo^, SizeOf(TProcInfo));
+end;
+
+procedure TSimpleBlockWriter.WriteToFileBuffered(const buf; count: Cardinal);
 var
   res    : boolean;
   place  : Cardinal;
@@ -184,13 +210,23 @@ begin
       bufp := OffsetPtr(bufp,BUF_SIZE);
     end; //while
   end
-  else bufp := @buf;
+  else
+    bufp := @buf;
   if count > 0 then begin // store leftovers
     Move(bufp^,OffsetPtr(fBuf,fBufOffs)^,count);
     Inc(fBufOffs,count);
   end;
 end;
 
+
+procedure TSimpleBlockWriter.WriteToFileDirect(const buf; count: Cardinal);
+var
+  res    : boolean;
+  written: Cardinal;
+begin
+  res := WriteFile(fFile,buf,count,written,nil);
+  if not res then RaiseLastWin32Error;
+end;
 
 procedure TSimpleBlockWriter.Flush;
 var

@@ -87,6 +87,8 @@ type
 
   TThreadInformationList = TObjectList<TThreadInformation>;
 
+ 
+
 var
   prfFile        : TSimpleBlockWriter;
   prfLock        : TRTLCriticalSection;
@@ -214,31 +216,50 @@ begin
   end;
 end; { WriteThread }
 
-procedure FlushCounter;
+function GetCounterAndReset(): comp;
 begin
-  if prfCounter.QuadPart <> 0 then begin
-    WriteTicks(prfCounter.QuadPart);
+  if prfCounter.QuadPart <> 0 then
+  begin
+    result := prfCounter.QuadPart;
     prfCounter.QuadPart := 0;
+  end
+  else
+    result := 0;
+end;
+
+
+
+procedure FlushCounter;
+var LCounter : Comp;
+begin
+  LCounter := GetCounterAndReset();
+  if LCounter <> 0 then begin
+    WriteTicks(LCounter);
   end;
 end; { FlushCounter }
+
+
 
 procedure profilerEnterProc(procID : integer);
 var
   ct : integer;
   cnt: TLargeinteger;
+  LInfo : PProcInfo;
 begin
   QueryPerformanceCounter(TInt64((@cnt)^));
   ct := GetCurrentThreadID;
 {$B+}
   if prfRunning and ((prfOnlyThread = 0) or (prfOnlyThread = ct)) then begin
 {$B-}
+    LInfo := GetMemory(SizeOf(TProcInfo));
+    LInfo^.Tag := PR_ENTERPROC;
+    LInfo^.Thread := ct;
+    LInfo^.ID := procID;
+    LInfo^.Ticks := cnt.QuadPart;
     EnterCriticalSection(prfLock);
     try
-      FlushCounter;
-      WriteTag(PR_ENTERPROC);
-      WriteThread(ct);
-      WriteID(procID);
-      WriteTicks(Cnt.QuadPart);
+      LInfo^.Ticks := GetCounterAndReset();
+      prfFile.WriteProcToFile(LInfo);
       QueryPerformanceCounter(TInt64((@prfCounter)^));
     finally LeaveCriticalSection(prfLock); end;
   end;
@@ -248,19 +269,22 @@ procedure ProfilerExitProc(procID : integer);
 var
   ct : integer;
   cnt: TLargeinteger;
+  LInfo : PProcInfo;
 begin
   QueryPerformanceCounter(TInt64((@Cnt)^));
   ct := GetCurrentThreadID;
 {$B+}
   if prfRunning and ((prfOnlyThread = 0) or (prfOnlyThread = ct)) then begin
 {$B-}
+    GetMem(LInfo, SizeOf(TProcInfo));
+    LInfo.Tag := PR_EXITPROC;
+    LInfo.Thread := ct;
+    LInfo.ID := procID;
+    LInfo.Ticks := cnt.QuadPart;
     EnterCriticalSection(prfLock);
     try
-      FlushCounter;
-      WriteTag(PR_EXITPROC);
-      WriteThread(ct);
-      WriteID(procID);
-      WriteTicks(Cnt.QuadPart);
+      LInfo.Ticks := GetCounterAndReset();
+      prfFile.WriteProcToFile(LInfo);
       QueryPerformanceCounter(TInt64((@prfCounter)^));
     finally LeaveCriticalSection(prfLock); end;
   end;
@@ -456,7 +480,7 @@ begin
       prfName := profPrfOutputFile + '.prf';
     InitializeCriticalSection(prfLock);
     prfFile := TSimpleBlockWriter.Create(prfName);
-    if prfUseAsyncWriter then
+   // if prfUseAsyncWriter then
       prfFile.Start;
     QueryPerformanceFrequency(TInt64((@prfFreq)^));
   end;
